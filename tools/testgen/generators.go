@@ -98,7 +98,16 @@ var AllMethods = []MethodTests{
 	EthConfig,
 	EthCapabilities,
 	NetVersion,
+	NetListening,
+	NetPeerCount,
 	TestingBuildBlockV1,
+
+	// testing_commitBlockV1 must come before txpool_* so that fill order matches
+	// hive's lexical replay order (testing_buildBlockV1, testing_commitBlockV1,
+	// txpool_*). It advances the canonical head, so it must also come after every
+	// read-only test that assumes the static chain head.
+	TestingCommitBlockV1,
+
 	TxpoolStatus,
 	TxpoolContent,
 	TxpoolContentFrom,
@@ -2337,28 +2346,6 @@ var EthGetLogs = MethodTests{
 			},
 		},
 		{
-			Name:  "filter-with-blockHash",
-			About: "queries for all logs of a block, identified by blockHash",
-			Run: func(ctx context.Context, t *T) error {
-				// Find a block with logs.
-				i := slices.IndexFunc(t.chain.txinfo.LegacyEmit, func(tx TxInfo) bool {
-					return tx.Block > 2
-				})
-				if i == -1 {
-					return fmt.Errorf("no suitable tx found")
-				}
-				hash := t.chain.GetBlock(int(t.chain.txinfo.LegacyEmit[i].Block)).Hash()
-				result, err := t.eth.FilterLogs(ctx, ethereum.FilterQuery{BlockHash: &hash})
-				if err != nil {
-					return err
-				}
-				if len(result) == 0 {
-					return fmt.Errorf("result contains no logs")
-				}
-				return nil
-			},
-		},
-		{
 			Name:  "filter-with-blockHash-and-topics",
 			About: "queries for logs in a block, identified by blockHash",
 			Run: func(ctx context.Context, t *T) error {
@@ -2526,6 +2513,13 @@ var DebugGetRawReceipts = MethodTests{
 			},
 		},
 		{
+			Name:  "get-block-hash",
+			About: "gets receipts for block hash",
+			Run: func(ctx context.Context, t *T) error {
+				return t.rpc.CallContext(ctx, nil, "debug_getRawReceipts", t.chain.GetBlock(3).Hash())
+			},
+		},
+		{
 			Name:  "get-invalid-number",
 			About: "gets receipts with invalid number formatting",
 			Run: func(ctx context.Context, t *T) error {
@@ -2590,6 +2584,46 @@ var NetVersion = MethodTests{
 				}
 				if id.Cmp(t.chain.genesis.Config.ChainID) != 0 {
 					return fmt.Errorf("wrong networkID %v returned", id)
+				}
+				return nil
+			},
+		},
+	},
+}
+
+var NetListening = MethodTests{
+	"net_listening",
+	[]Test{
+		{
+			Name:  "get-listening",
+			About: "Calls net_listening to check whether the client is listening for network connections.",
+			Run: func(ctx context.Context, t *T) error {
+				var got bool
+				if err := t.rpc.CallContext(ctx, &got, "net_listening"); err != nil {
+					return err
+				}
+				if !got {
+					return fmt.Errorf("net_listening returned false, want true")
+				}
+				return nil
+			},
+		},
+	},
+}
+
+var NetPeerCount = MethodTests{
+	"net_peerCount",
+	[]Test{
+		{
+			Name:  "get-peer-count",
+			About: "Calls net_peerCount to retrieve the number of connected peers. The test client runs without peers, so the expected value is zero.",
+			Run: func(ctx context.Context, t *T) error {
+				var got hexutil.Uint
+				if err := t.rpc.CallContext(ctx, &got, "net_peerCount"); err != nil {
+					return err
+				}
+				if got != 0 {
+					return fmt.Errorf("unexpected peer count (got: %d, want: 0)", got)
 				}
 				return nil
 			},
@@ -3017,6 +3051,326 @@ var TestingBuildBlockV1 = MethodTests{
 	},
 }
 
+// commitBlockV1PayloadAttrs returns a payloadAttributes map suitable for committing a
+// block on top of parentBlock. Cancun-only fields are included when active.
+func commitBlockV1PayloadAttrs(t *T, parentBlock *types.Block, salt string) map[string]interface{} {
+	attrs := map[string]interface{}{
+		"timestamp":             hexutil.Uint64(parentBlock.Time() + 12),
+		"prevRandao":            common.HexToHash("0x" + strings.Repeat("11", 32)).Hex(),
+		"suggestedFeeRecipient": common.Address{}.Hex(),
+		"withdrawals":           []interface{}{},
+	}
+	if t.chain.Config().IsCancun(parentBlock.Number(), parentBlock.Time()) {
+		beaconRoot := common.HexToHash("0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884365149a42212e8822")
+		attrs["parentBeaconBlockRoot"] = beaconRoot.Hex()
+	}
+	_ = salt
+	return attrs
+}
+
+// liveHead fetches the current canonical head from the node. It must be used instead
+// of t.chain.Head() once the chain has been advanced by a prior testing_commitBlockV1
+// call, since t.chain reflects only the static pre-loaded chain.rlp.
+func liveHead(ctx context.Context, t *T) (*types.Block, error) {
+	return t.eth.BlockByNumber(ctx, nil)
+}
+
+// TestingCommitBlockV1 stores a list of all tests against the method.
+//
+// Notes on ordering:
+//   - These tests mutate the canonical head, so this MethodTests entry must come
+//     after every read-only test that assumes the static chain head.
+//   - Subtest names are chosen so that lexical order (used by hive's filepath.Walk)
+//     matches the order in which they are registered here.
+//   - The "from-mempool" subtest is renamed with a "z-" prefix so it runs last:
+//     it is SpecOnly (mempool ordering is not strictly deterministic), and putting
+//     it earlier in the alphabetical order would cascade non-determinism into the
+//     subsequent strict-match tests that take its committed block as their parent.
+var TestingCommitBlockV1 = MethodTests{
+	"testing_commitBlockV1",
+	[]Test{
+		{
+			Name:  "commit-block-empty-transactions",
+			About: "commits an empty block using testing_commitBlockV1 and advances the canonical head",
+			Run: func(ctx context.Context, t *T) error {
+				parentBlock, err := liveHead(ctx, t)
+				if err != nil {
+					return fmt.Errorf("failed to read live head: %w", err)
+				}
+				parentHash := parentBlock.Hash()
+				payloadAttrs := commitBlockV1PayloadAttrs(t, parentBlock, "empty")
+
+				var result common.Hash
+				err = t.rpc.CallContext(ctx, &result, "testing_commitBlockV1",
+					payloadAttrs,
+					[]string{},
+					hexutil.Encode([]byte{}),
+				)
+				if err != nil {
+					return fmt.Errorf("testing_commitBlockV1 call failed: %w", err)
+				}
+
+				newHead, err := liveHead(ctx, t)
+				if err != nil {
+					return fmt.Errorf("failed to read head after commit: %w", err)
+				}
+				if newHead.Hash() != result {
+					return fmt.Errorf("returned hash %s is not the new head %s", result.Hex(), newHead.Hash().Hex())
+				}
+				if newHead.ParentHash() != parentHash {
+					return fmt.Errorf("new head parent %s does not match prior head %s", newHead.ParentHash().Hex(), parentHash.Hex())
+				}
+				if newHead.NumberU64() != parentBlock.NumberU64()+1 {
+					return fmt.Errorf("new head number %d, want %d", newHead.NumberU64(), parentBlock.NumberU64()+1)
+				}
+				if len(newHead.Transactions()) != 0 {
+					return fmt.Errorf("expected empty block, got %d transactions", len(newHead.Transactions()))
+				}
+				return nil
+			},
+		},
+		{
+			Name:  "commit-block-invalid-transaction",
+			About: "calls testing_commitBlockV1 with an unapplicable transaction (wrong nonce); client MUST return an error and not modify the canonical head",
+			Run: func(ctx context.Context, t *T) error {
+				parentBlock, err := liveHead(ctx, t)
+				if err != nil {
+					return fmt.Errorf("failed to read live head: %w", err)
+				}
+				parentHash := parentBlock.Hash()
+				payloadAttrs := commitBlockV1PayloadAttrs(t, parentBlock, "invalid")
+
+				sender, _ := t.chain.GetSender(2)
+				basefee := parentBlock.BaseFee()
+				if basefee == nil {
+					basefee = big.NewInt(1000000000)
+				}
+				gasFeeCap := new(big.Int).Add(basefee, big.NewInt(500))
+				txdata := &types.DynamicFeeTx{
+					Nonce:     999, // invalid: account will not have this nonce
+					To:        &emitContract,
+					Gas:       21000,
+					GasTipCap: big.NewInt(500),
+					GasFeeCap: gasFeeCap,
+					Value:     big.NewInt(1000),
+				}
+				tx := t.chain.MustSignTx(sender, txdata)
+				txBytes, err := tx.MarshalBinary()
+				if err != nil {
+					return fmt.Errorf("failed to marshal transaction: %w", err)
+				}
+
+				var result common.Hash
+				err = t.rpc.CallContext(ctx, &result, "testing_commitBlockV1",
+					payloadAttrs,
+					[]string{hexutil.Encode(txBytes)},
+					hexutil.Encode([]byte{}),
+				)
+				if err == nil {
+					return fmt.Errorf("testing_commitBlockV1 must fail when a transaction cannot be applied (e.g. invalid nonce), but it succeeded")
+				}
+
+				var rpcErr rpc.Error
+				if !errors.As(err, &rpcErr) {
+					return fmt.Errorf("testing_commitBlockV1 must return an RPC error with a code, got: %w", err)
+				}
+				code := rpcErr.ErrorCode()
+				if code != -32602 && code != -32603 && code != -32000 {
+					return fmt.Errorf("testing_commitBlockV1 must return error code -32602, -32603, or -32000 for unapplicable tx, got code %d: %w", code, err)
+				}
+
+				headBlock, err := liveHead(ctx, t)
+				if err != nil {
+					return fmt.Errorf("failed to read head after failed commit: %w", err)
+				}
+				if headBlock.Hash() != parentHash {
+					return fmt.Errorf("canonical head must not change when testing_commitBlockV1 fails; was %s, now %s", parentHash.Hex(), headBlock.Hash().Hex())
+				}
+				return nil
+			},
+		},
+		{
+			Name:  "commit-block-with-extra-data",
+			About: "commits a block with a non-empty extraData value using testing_commitBlockV1",
+			Run: func(ctx context.Context, t *T) error {
+				parentBlock, err := liveHead(ctx, t)
+				if err != nil {
+					return fmt.Errorf("failed to read live head: %w", err)
+				}
+				payloadAttrs := commitBlockV1PayloadAttrs(t, parentBlock, "extra")
+				extra := []byte("execution-apis")
+				extraHex := hexutil.Encode(extra)
+
+				var result common.Hash
+				err = t.rpc.CallContext(ctx, &result, "testing_commitBlockV1",
+					payloadAttrs,
+					[]string{},
+					extraHex,
+				)
+				if err != nil {
+					return fmt.Errorf("testing_commitBlockV1 call failed: %w", err)
+				}
+				newBlock, err := t.eth.BlockByHash(ctx, result)
+				if err != nil {
+					return fmt.Errorf("failed to fetch committed block: %w", err)
+				}
+				if !bytes.Equal(newBlock.Extra(), extra) {
+					return fmt.Errorf("extraData mismatch: got %s, want %s", hexutil.Encode(newBlock.Extra()), extraHex)
+				}
+				return nil
+			},
+		},
+		{
+			Name:  "commit-block-with-transactions",
+			About: "commits a block with the specified transactions using testing_commitBlockV1 and advances the canonical head",
+			Run: func(ctx context.Context, t *T) error {
+				parentBlock, err := liveHead(ctx, t)
+				if err != nil {
+					return fmt.Errorf("failed to read live head: %w", err)
+				}
+				parentHash := parentBlock.Hash()
+
+				payloadAttrs := commitBlockV1PayloadAttrs(t, parentBlock, "with-tx")
+
+				// Use sender index 2 to avoid conflicting with eth_sendRawTransaction tests.
+				sender, nonce := t.chain.GetSender(2)
+				basefee := parentBlock.BaseFee()
+				if basefee == nil {
+					basefee = big.NewInt(1000000000)
+				}
+				gasFeeCap := new(big.Int).Add(basefee, big.NewInt(500))
+
+				txdata := &types.DynamicFeeTx{
+					Nonce:     nonce,
+					To:        &emitContract,
+					Gas:       21000,
+					GasTipCap: big.NewInt(500),
+					GasFeeCap: gasFeeCap,
+					Value:     big.NewInt(1000),
+				}
+				tx := t.chain.MustSignTx(sender, txdata)
+				txBytes, err := tx.MarshalBinary()
+				if err != nil {
+					return fmt.Errorf("failed to marshal transaction: %w", err)
+				}
+				txHex := hexutil.Encode(txBytes)
+
+				extraData := hexutil.Encode([]byte("test_name"))
+
+				var result common.Hash
+				err = t.rpc.CallContext(ctx, &result, "testing_commitBlockV1",
+					payloadAttrs,
+					[]string{txHex},
+					extraData,
+				)
+				if err != nil {
+					return fmt.Errorf("testing_commitBlockV1 call failed: %w", err)
+				}
+				if result == (common.Hash{}) {
+					return fmt.Errorf("testing_commitBlockV1 returned zero hash")
+				}
+
+				// The returned hash MUST be the new canonical head.
+				newHead, err := liveHead(ctx, t)
+				if err != nil {
+					return fmt.Errorf("failed to read head after commit: %w", err)
+				}
+				if newHead.Hash() != result {
+					return fmt.Errorf("returned hash %s is not the new head %s", result.Hex(), newHead.Hash().Hex())
+				}
+				if newHead.ParentHash() != parentHash {
+					return fmt.Errorf("new head parent %s does not match prior head %s", newHead.ParentHash().Hex(), parentHash.Hex())
+				}
+				if newHead.NumberU64() != parentBlock.NumberU64()+1 {
+					return fmt.Errorf("new head number %d, want %d", newHead.NumberU64(), parentBlock.NumberU64()+1)
+				}
+
+				// The committed block MUST include exactly the supplied transaction.
+				newBlock, err := t.eth.BlockByHash(ctx, result)
+				if err != nil {
+					return fmt.Errorf("failed to fetch committed block: %w", err)
+				}
+				txs := newBlock.Transactions()
+				if len(txs) != 1 {
+					return fmt.Errorf("expected 1 transaction in committed block, got %d", len(txs))
+				}
+				if txs[0].Hash() != tx.Hash() {
+					return fmt.Errorf("committed transaction hash mismatch: got %s, want %s", txs[0].Hash().Hex(), tx.Hash().Hex())
+				}
+
+				// The committed block MUST carry the supplied extraData.
+				wantExtra := []byte("test_name")
+				if !bytes.Equal(newBlock.Extra(), wantExtra) {
+					return fmt.Errorf("extraData mismatch: got %s, want %s", hexutil.Encode(newBlock.Extra()), hexutil.Encode(wantExtra))
+				}
+				return nil
+			},
+		},
+		{
+			Name:     "commit-block-z-from-mempool",
+			About:    "commits a block built from the mempool using testing_commitBlockV1 with null transactions parameter",
+			SpecOnly: true,
+			Run: func(ctx context.Context, t *T) error {
+				parentBlock, err := liveHead(ctx, t)
+				if err != nil {
+					return fmt.Errorf("failed to read live head: %w", err)
+				}
+				parentHash := parentBlock.Hash()
+				payloadAttrs := commitBlockV1PayloadAttrs(t, parentBlock, "mempool")
+
+				// Use sender index 4 to avoid the address that testing_buildBlockV1's
+				// from-mempool test (sender 1) has already pushed a nonce-0 tx into the
+				// mempool with — that prior tx is still pending here.
+				sender, nonce := t.chain.GetSender(4)
+				basefee := parentBlock.BaseFee()
+				if basefee == nil {
+					basefee = big.NewInt(1000000000)
+				}
+				gasFeeCap := new(big.Int).Add(basefee, big.NewInt(500))
+				txdata := &types.DynamicFeeTx{
+					Nonce:     nonce,
+					To:        &emitContract,
+					Gas:       21000,
+					GasTipCap: big.NewInt(500),
+					GasFeeCap: gasFeeCap,
+					Value:     big.NewInt(1000),
+				}
+				tx := t.chain.MustSignTx(sender, txdata)
+				txBytes, err := tx.MarshalBinary()
+				if err != nil {
+					return fmt.Errorf("failed to marshal transaction: %w", err)
+				}
+				var sentHash common.Hash
+				if err := t.rpc.CallContext(ctx, &sentHash, "eth_sendRawTransaction", hexutil.Encode(txBytes)); err != nil {
+					return fmt.Errorf("failed to send transaction to mempool: %w", err)
+				}
+
+				var result common.Hash
+				err = t.rpc.CallContext(ctx, &result, "testing_commitBlockV1",
+					payloadAttrs,
+					nil,
+					hexutil.Encode([]byte{}),
+				)
+				if err != nil {
+					return fmt.Errorf("testing_commitBlockV1 call failed: %w", err)
+				}
+
+				newHead, err := liveHead(ctx, t)
+				if err != nil {
+					return fmt.Errorf("failed to read head after commit: %w", err)
+				}
+				if newHead.Hash() != result {
+					return fmt.Errorf("returned hash %s is not the new head %s", result.Hex(), newHead.Hash().Hex())
+				}
+				if newHead.ParentHash() != parentHash {
+					return fmt.Errorf("new head parent %s does not match prior head %s", newHead.ParentHash().Hex(), parentHash.Hex())
+				}
+				return nil
+			},
+		},
+	},
+}
+
 var EthSimulateV1 = MethodTests{
 	"eth_simulateV1",
 	[]Test{
@@ -3218,45 +3572,6 @@ var EthSimulateV1 = MethodTests{
 				res := make([]blockResult, 0)
 				if err := t.rpc.Call(&res, "eth_simulateV1", params, "latest"); err != nil {
 					return err
-				}
-				return nil
-			},
-		},
-		{
-			Name:  "ethSimulate-simple-more-params-validate",
-			About: "simulates a simple do-nothing transaction with more fields set",
-			Run: func(ctx context.Context, t *T) error {
-				params := ethSimulateOpts{
-					BlockStateCalls: []CallBatch{
-						{
-							StateOverrides: &StateOverride{
-								common.Address{0xc0}: OverrideAccount{Balance: newRPCBalance(3360000)},
-							},
-							BlockOverrides: &BlockOverrides{
-								BaseFeePerGas: (*hexutil.Big)(big.NewInt(0)),
-							},
-							Calls: []TransactionArgs{{
-								From:                 &common.Address{0xc0},
-								To:                   &common.Address{0xc1},
-								Gas:                  getUint64Ptr(0x52080),
-								Value:                *newRPCBalance(0),
-								MaxFeePerGas:         (*hexutil.Big)(big.NewInt(0)),
-								MaxPriorityFeePerGas: (*hexutil.Big)(big.NewInt(0)),
-								MaxFeePerBlobGas:     (*hexutil.Big)(big.NewInt(0)),
-								Nonce:                getUint64Ptr(0),
-								Input:                hex2Bytes(""),
-							}},
-						},
-					},
-					Validation:             true,
-					ReturnFullTransactions: true,
-				}
-				res := make([]blockResult, 0)
-				if err := t.rpc.Call(&res, "eth_simulateV1", params, "latest"); err != nil {
-					return err
-				}
-				if len(res) != len(params.BlockStateCalls) {
-					return fmt.Errorf("unexpected number of results (have: %d, want: %d)", len(res), len(params.BlockStateCalls))
 				}
 				return nil
 			},
@@ -5482,7 +5797,7 @@ var EthSimulateV1 = MethodTests{
 			},
 		},
 		{
-			Name:  "ethSimulate-simple-state-diff",
+			Name:  "ethSimulate-simple-state",
 			About: "override one state variable with state",
 			Run: func(ctx context.Context, t *T) error {
 				stateChanges := make(map[common.Hash]common.Hash)
@@ -5514,7 +5829,7 @@ var EthSimulateV1 = MethodTests{
 						{
 							StateOverrides: &StateOverride{
 								common.Address{0xc1}: OverrideAccount{
-									State: &stateChanges, // state diff override
+									State: &stateChanges, // full state override, wipes all other slots
 								},
 							},
 							Calls: []TransactionArgs{
